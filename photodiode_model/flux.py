@@ -1,8 +1,9 @@
 # function that computes photon flux
 # todo: Add in polylchromatic model.
 import constants
+from light_source import LightSource
 
-def flux(P, lam, A, model = 'monochromatic'):
+def flux(source: LightSource, t: float, model='monochromatic') -> float:
     """
     Compute photon flux based on the incident light
 
@@ -24,6 +25,7 @@ def flux(P, lam, A, model = 'monochromatic'):
     -----
     """
     if model == 'monochromatic':
-        return (P / A) * lam / (constants.h * constants.c)   # photons / (m^2 s)
+        P = source.power(t)
+        return (P / source.area) * source.lam / (constants.h * constants.c)
     else:
         raise ValueError(f"Unknown absorbance model: {model}")

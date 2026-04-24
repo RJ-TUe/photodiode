@@ -1,0 +1,658 @@
+"""
+Photodetector Physics Model
+===========================
+Implements the carrier rate equation (4.1) and Gauss's law (4.2) for a
+semiconductor photodetector under illumination and applied bias.
+
+Rate equation (4.1):
+    ∂n/∂t = G - R - (1/q) ∇·(J_drift(E) + J_diff(E))
+
+Gauss's law (4.2):
+    ∇·E = (q/ε)(p - n + N_n - N_p)
+
+The model is 0-D (lumped / uniform-field), so spatial derivatives are
+replaced by effective quantities: the divergence of J becomes J_total/d,
+where d is the absorption layer thickness.
+
+Inputs
+------
+  - Wavelength λ [m]
+  - Photon flux Φ [photons m⁻² s⁻¹]
+  - Bias voltage V_bias [V]
+  - Semiconductor material (choose from MATERIALS dict)
+
+Outputs
+-------
+  - Steady-state electron density n [m⁻³]
+  - Electric field E [V/m]
+  - Photocurrent density J [A/m²]
+  - Responsivity R [A/W]
+  - Quantum efficiency η_int (internal, after absorption)
+"""
+
+import numpy as np
+from scipy.integrate import solve_ivp
+from scipy.optimize import brentq
+import warnings
+
+# ── Physical constants ────────────────────────────────────────────────────────
+q   = 1.602e-19   # Elementary charge [C]
+eps0= 8.854e-12   # Permittivity of free space [F/m]
+hc  = 1.986e-25   # h·c  [J·m]
+kB  = 1.381e-23   # Boltzmann constant [J/K]
+
+# ── Semiconductor material library ───────────────────────────────────────────
+# All parameters at 300 K unless noted.
+# Sources: Sze & Ng "Physics of Semiconductor Devices", 3rd ed.
+MATERIALS = {
+    "Si": {
+        "description"    : "Silicon — workhorse detector, NIR",
+        "bandgap_eV"     : 1.12,          # E_g [eV]
+        "epsilon_r"      : 11.7,          # Relative permittivity
+        "mu_n"           : 0.1350,        # Electron mobility [m²/V·s]
+        "mu_p"           : 0.0480,        # Hole mobility [m²/V·s]
+        "tau_n"          : 1e-6,          # Electron lifetime [s]  (lightly doped)
+        "tau_p"          : 1e-6,          # Hole lifetime [s]
+        "n_i"            : 9.65e9 * 1e6,  # Intrinsic carrier density [m⁻³]
+        "alpha_coeff"    : (1e7, 1.1e-6), # (α₀ [m⁻¹], λ_gap [m]) for Urbach model
+        "D_n"            : 0.0025,        # Electron diffusivity [m²/s]  (D=μkT/q)
+        "D_p"            : 0.00125,
+    },
+    "GaAs": {
+        "description"    : "Gallium Arsenide — fast, direct-gap, near-IR",
+        "bandgap_eV"     : 1.42,
+        "epsilon_r"      : 12.9,
+        "mu_n"           : 0.8500,
+        "mu_p"           : 0.0400,
+        "tau_n"          : 1e-8,
+        "tau_p"          : 1e-8,
+        "n_i"            : 2.0e6 * 1e6,
+        "alpha_coeff"    : (1.5e8, 0.87e-6),
+        "D_n"            : 0.022,
+        "D_p"            : 0.001,
+    },
+    "InGaAs": {
+        "description"    : "In₀.₅₃Ga₀.₄₇As — telecom C-band (1550 nm)",
+        "bandgap_eV"     : 0.74,
+        "epsilon_r"      : 13.9,
+        "mu_n"           : 0.6800,
+        "mu_p"           : 0.0500,
+        "tau_n"          : 2e-9,
+        "tau_p"          : 2e-9,
+        "n_i"            : 6.3e11 * 1e6,
+        "alpha_coeff"    : (2e8, 1.65e-6),
+        "D_n"            : 0.0176,
+        "D_p"            : 0.0013,
+    },
+    "Ge": {
+        "description"    : "Germanium — extended NIR up to ~1600 nm",
+        "bandgap_eV"     : 0.66,
+        "epsilon_r"      : 16.0,
+        "mu_n"           : 0.3900,
+        "mu_p"           : 0.1900,
+        "tau_n"          : 1e-6,
+        "tau_p"          : 1e-6,
+        "n_i"            : 2.4e13 * 1e6,
+        "alpha_coeff"    : (1e8, 1.55e-6),
+        "D_n"            : 0.0101,
+        "D_p"            : 0.0049,
+    },
+}
+
+
+# ── Optical absorption ────────────────────────────────────────────────────────
+
+def photon_energy(wavelength: float) -> float:
+    """Photon energy E_ph = hc/λ [J]."""
+    return hc / wavelength
+
+
+def absorption_coefficient(wavelength: float, material: dict) -> float:
+    """
+    Simple Urbach-edge model for the absorption coefficient α [m⁻¹].
+
+    Below the bandgap: α ≈ 0 (transparent).
+    Above the bandgap: α grows steeply.  We use a piecewise power-law
+    calibrated to α₀ at the gap wavelength λ_gap:
+
+        α(λ) = α₀ · exp( (λ_gap/λ - 1) · 20 )    for λ < λ_gap
+             = 0                                    for λ ≥ λ_gap
+
+    This is intentionally simplified; replace with tabulated data for accuracy.
+    """
+    alpha0, lam_gap = material["alpha_coeff"]
+    E_ph = photon_energy(wavelength)          # [J]
+    E_g  = material["bandgap_eV"] * q        # [J]
+
+    if E_ph <= E_g:
+        return 0.0  # Below bandgap — no absorption
+
+    # Heuristic exponential roll-on above bandgap
+    alpha = alpha0 * np.exp(20.0 * (E_ph / E_g - 1.0))
+    return min(alpha, alpha0 * 1e3)  # cap at 1000× α₀
+
+
+def generation_rate(
+    wavelength: float,
+    flux: float,
+    material: dict,
+    thickness: float,
+    eta_ext: float = 1.0,
+) -> float:
+    """
+    Volumetric generation rate G [m⁻³ s⁻¹].
+
+    G = η_ext · η_abs · Φ / d
+
+    where:
+      η_ext  = external quantum efficiency (coupling, reflection losses)
+      η_abs  = 1 - exp(-α·d)  (fraction of photons absorbed in thickness d)
+      Φ      = incident photon flux [photons/m²/s]
+      d      = absorption layer thickness [m]
+
+    Each absorbed photon creates one electron-hole pair (one carrier).
+    """
+    alpha   = absorption_coefficient(wavelength, material)
+    eta_abs = 1.0 - np.exp(-alpha * thickness)
+    G       = eta_ext * eta_abs * flux / thickness
+    return G, alpha, eta_abs
+
+
+# ── Recombination ─────────────────────────────────────────────────────────────
+
+def recombination_rate(
+    n: float,
+    p: float,
+    material: dict,
+    model: str = "SRH",
+) -> float:
+    """
+    Net recombination rate R [m⁻³ s⁻¹].
+
+    SRH (Shockley-Read-Hall) — dominant in indirect-gap (Si, Ge):
+        R = (np - n_i²) / (τ_p·(n + n_i) + τ_n·(p + n_i))
+
+    Radiative — dominant in direct-gap (GaAs, InGaAs):
+        R = B·(np - n_i²),  B ≈ 10⁻¹⁰ cm³/s converted to SI
+
+    Auger — significant at very high injection (ignored here for clarity).
+    """
+    n_i   = material["n_i"]
+    tau_n = material["tau_n"]
+    tau_p = material["tau_p"]
+    np_   = n * p
+    ni2   = n_i ** 2
+
+    if model == "SRH":
+        denom = tau_p * (n + n_i) + tau_n * (p + n_i)
+        R = (np_ - ni2) / denom if denom > 0 else 0.0
+    elif model == "radiative":
+        B = 1e-16   # Radiative coefficient [m³/s], typical for GaAs
+        R = B * (np_ - ni2)
+    else:
+        raise ValueError(f"Unknown recombination model: {model}")
+
+    return max(R, 0.0)
+
+
+# ── Drift and diffusion currents ──────────────────────────────────────────────
+
+def current_densities(
+    n: float,
+    p: float,
+    E_field: float,
+    material: dict,
+    dn_dx: float = 0.0,
+    dp_dx: float = 0.0,
+) -> dict:
+    """
+    Drift + diffusion current densities [A/m²].
+
+    J_drift_n  = q · n · μ_n · E
+    J_drift_p  = q · p · μ_p · E
+    J_diff_n   = q · D_n · dn/dx      (positive gradient → positive current)
+    J_diff_p   = -q · D_p · dp/dx     (holes flow down gradient)
+    """
+    mu_n = material["mu_n"]
+    mu_p = material["mu_p"]
+    D_n  = material["D_n"]
+    D_p  = material["D_p"]
+
+    J_drift_n = q * n * mu_n * E_field
+    J_drift_p = q * p * mu_p * E_field
+    J_diff_n  = q * D_n * dn_dx
+    J_diff_p  = -q * D_p * dp_dx
+
+    J_total_n = J_drift_n + J_diff_n
+    J_total_p = J_drift_p + J_diff_p
+    J_total   = J_total_n + J_total_p
+
+    return {
+        "J_drift_n": J_drift_n,
+        "J_drift_p": J_drift_p,
+        "J_diff_n" : J_diff_n,
+        "J_diff_p" : J_diff_p,
+        "J_n"      : J_total_n,
+        "J_p"      : J_total_p,
+        "J_total"  : J_total,
+    }
+
+
+# ── Electric field via Gauss's law ────────────────────────────────────────────
+
+def electric_field_gauss(
+    n: float,
+    p: float,
+    N_n: float,
+    N_p: float,
+    material: dict,
+    V_bias: float,
+    thickness: float,
+) -> float:
+    """
+    Spatially-averaged electric field [V/m] in the 0-D approximation.
+
+    The full Gauss's law:
+        dE/dx = (q/ε)(p - n + N_n - N_p)
+
+    Integrating over thickness d with boundary condition E·d = V_bias
+    (ignoring built-in potential for simplicity; add V_bi for p-n junction):
+
+        E = V_bias / d  +  (q·d / 2ε)(p - n + N_n - N_p)
+
+    The first term is the applied field; the second is the space-charge
+    correction — this is the space-charge effect mentioned in section 2.1.1.
+    """
+    eps = material["epsilon_r"] * eps0
+    rho = q * (p - n + N_n - N_p)           # Net charge density [C/m³]
+
+    E_applied     = V_bias / thickness       # Field from bias
+    E_space_charge = rho * thickness / (2 * eps)  # Space-charge correction
+
+    return E_applied + E_space_charge
+
+
+# ── ODE system (rate equations) ───────────────────────────────────────────────
+
+def build_ode(
+    material: dict,
+    G: float,
+    N_n: float,
+    N_p: float,
+    V_bias: float,
+    thickness: float,
+    recomb_model: str = "SRH",
+    T: float = 300.0,
+) -> callable:
+    """
+    Returns the ODE RHS for excess carrier densities: state y = [Δn, Δp].
+
+    Reformulated in EXCESS carriers Δn = n - n₀, Δp = p - p₀ for numerical
+    stability.  At thermal equilibrium Δn = Δp = 0 by definition.
+
+    Physics:
+        ∂(Δn)/∂t = G - R_net - Δn/τ_transit_n
+        ∂(Δp)/∂t = G - R_net - Δp/τ_transit_p
+
+    The carrier transit (drift) time τ_transit = d / v_drift = d / (µ·|E|)
+    replaces the raw J/d term.  This is equivalent but numerically stable
+    because it naturally limits the loss rate to physically sensible values
+    and avoids division-by-near-zero in carrier density.
+
+    The electric field is computed from the DOPING ONLY (depletion
+    approximation), which is valid under reverse bias where the space-charge
+    from photogenerated carriers is a small perturbation.  This decouples
+    the stiff field-carrier feedback loop.
+    """
+    # Pre-compute equilibrium carrier densities
+    n_i = material["n_i"]
+    n0  = N_n if N_n > N_p else n_i
+    p0  = n_i**2 / n0
+
+    # Electric field fixed from bias + doping (depletion approx.)
+    # Under reverse bias the field is dominated by V_bias/d
+    E_static = abs(V_bias) / thickness  # [V/m], always positive magnitude
+
+    # Transit times [s] — minimum clamped to avoid 1/0
+    mu_n = material["mu_n"]
+    mu_p = material["mu_p"]
+    v_n  = mu_n * E_static          # Drift velocity electrons [m/s]
+    v_p  = mu_p * E_static          # Drift velocity holes [m/s]
+    # Transit time = thickness / velocity; clamp to avoid div-by-zero at V=0
+    tau_tr_n = thickness / max(v_n, 1e-10)
+    tau_tr_p = thickness / max(v_p, 1e-10)
+
+    def dydt(t, y):
+        dn, dp = max(y[0], 0.0), max(y[1], 0.0)   # excess carriers ≥ 0
+        n = n0 + dn
+        p = p0 + dp
+
+        # Net recombination (SRH or radiative) on TOTAL densities
+        R_total = recombination_rate(n, p, material, model=recomb_model)
+        # Equilibrium recombination (dark) — subtract so only net excess recombines
+        R_dark  = recombination_rate(n0, p0, material, model=recomb_model)
+        R_net   = max(R_total - R_dark, 0.0)
+
+        # Drift loss: excess carriers swept to contacts at transit time rate
+        loss_n = dn / tau_tr_n
+        loss_p = dp / tau_tr_p
+
+        d_dn_dt = G - R_net - loss_n
+        d_dp_dt = G - R_net - loss_p
+
+        return [d_dn_dt, d_dp_dt]
+
+    return dydt, n0, p0, E_static, tau_tr_n, tau_tr_p
+
+
+# ── Main solver ───────────────────────────────────────────────────────────────
+
+def solve_photodetector(
+    wavelength: float,
+    flux: float,
+    material_name: str = "Si",
+    V_bias: float = -5.0,
+    N_n: float = 1e21,          # Donor doping [m⁻³]  (1e15 cm⁻³)
+    N_p: float = 0.0,           # Acceptor doping [m⁻³]
+    thickness: float = 1e-4,    # Absorption layer thickness [m] (100 µm)
+    eta_ext: float = 0.9,       # External QE (coupling + AR coating)
+    recomb_model: str = "SRH",
+    t_end: float = None,        # Simulation end time [s]; None = auto
+    T: float = 300.0,
+) -> dict:
+    """
+    Solve the photodetector rate equations for a given illumination condition.
+
+    Parameters
+    ----------
+    wavelength   : float — Illumination wavelength [m]
+    flux         : float — Incident photon flux [photons/m²/s]
+    material_name: str   — Key into MATERIALS dict
+    V_bias       : float — Applied bias voltage [V] (negative = reverse bias)
+    N_n          : float — n-type doping concentration [m⁻³]
+    N_p          : float — p-type doping concentration [m⁻³]
+    thickness    : float — Device thickness [m]
+    eta_ext      : float — External quantum efficiency (0–1)
+    recomb_model : str   — "SRH" or "radiative"
+    t_end        : float — Integration end time [s]
+    T            : float — Temperature [K]
+
+    Returns
+    -------
+    dict with steady-state and transient results.
+    """
+    if material_name not in MATERIALS:
+        raise ValueError(f"Unknown material '{material_name}'. Choose from: {list(MATERIALS)}")
+
+    mat = MATERIALS[material_name]
+    E_ph = photon_energy(wavelength)
+    E_g  = mat["bandgap_eV"] * q
+
+    # ── Warn if photon energy below bandgap ──────────────────────────────────
+    if E_ph < E_g:
+        warnings.warn(
+            f"Photon energy {E_ph/q:.3f} eV < bandgap {mat['bandgap_eV']:.3f} eV "
+            f"for {material_name}. Device will be transparent at this wavelength."
+        )
+
+    # ── Generation rate ──────────────────────────────────────────────────────
+    G, alpha, eta_abs = generation_rate(wavelength, flux, mat, thickness, eta_ext)
+    eta_total = eta_ext * eta_abs   # Total (external × absorption) QE
+
+    # ── Build ODE; extract equilibrium densities and transit times ──────────
+    ode_fn, n0, p0, E_static, tau_tr_n, tau_tr_p = build_ode(
+        mat, G, N_n, N_p, V_bias, thickness, recomb_model, T
+    )
+
+    # ── Auto time scale ───────────────────────────────────────────────────────
+    # Steady state reached at roughly max(τ_lifetime, τ_transit)
+    tau_life = min(mat["tau_n"], mat["tau_p"])
+    if t_end is None:
+        t_end = 20.0 * max(tau_life, tau_tr_n, tau_tr_p)
+
+    # ── Initial conditions: zero excess carriers (thermal equilibrium) ────────
+    y0 = [0.0, 0.0]   # [Δn, Δp] in m⁻³
+
+    # ── Integrate ODE ─────────────────────────────────────────────────────────
+    sol = solve_ivp(
+        ode_fn,
+        t_span=[0.0, t_end],
+        y0=y0,
+        method="BDF",
+        rtol=1e-6,
+        atol=1.0,           # 1 m⁻³ — sensible for carrier densities
+        dense_output=True,
+        max_step=t_end / 500,
+    )
+
+    if not sol.success:
+        raise RuntimeError(f"ODE solver failed: {sol.message}")
+
+    # ── Steady-state (final time point) ──────────────────────────────────────
+    delta_n = max(sol.y[0, -1], 0.0)
+    delta_p = max(sol.y[1, -1], 0.0)
+    n_ss    = n0 + delta_n
+    p_ss    = p0 + delta_p
+
+    E_ss  = electric_field_gauss(n_ss, p_ss, N_n, N_p, mat, V_bias, thickness)
+    R_ss  = recombination_rate(n_ss, p_ss, mat, model=recomb_model)
+    J_ss  = current_densities(n_ss, p_ss, E_ss, mat)
+
+    # ── Figures of merit ─────────────────────────────────────────────────────
+    # Optical power density incident [W/m²]
+    P_optical = flux * E_ph
+
+    # Responsivity R = J_photo / P_optical  [A/W]
+    # J_photo = photocurrent density (total current minus dark current)
+    E_dark = electric_field_gauss(n0, p0, N_n, N_p, mat, V_bias, thickness)
+    J_dark = current_densities(n0, p0, E_dark, mat)
+    J_photo = abs(J_ss["J_total"]) - abs(J_dark["J_total"])
+
+    responsivity = J_photo / P_optical if P_optical > 0 else 0.0
+
+    # Internal quantum efficiency: carriers collected per absorbed photon
+    # η_int = J_photo / (q · G · d)
+    carrier_gen_current = q * G * thickness   # [A/m²] if all carriers collected
+    eta_int = J_photo / carrier_gen_current if carrier_gen_current > 0 else 0.0
+
+    return {
+        # ── Inputs ──────────────────────────────────────────────────────────
+        "material"         : material_name,
+        "wavelength_nm"    : wavelength * 1e9,
+        "flux_ph_m2_s"     : flux,
+        "V_bias"           : V_bias,
+        "N_n_cm3"          : N_n * 1e-6,
+        "N_p_cm3"          : N_p * 1e-6,
+        "thickness_um"     : thickness * 1e6,
+
+        # ── Optical ─────────────────────────────────────────────────────────
+        "E_photon_eV"      : E_ph / q,
+        "alpha_cm1"        : alpha * 1e-2,          # [cm⁻¹] for readability
+        "eta_absorption"   : eta_abs,
+        "eta_external"     : eta_ext,
+        "eta_total"        : eta_total,
+        "G_cm3_s"          : G * 1e-6,              # [cm⁻³ s⁻¹]
+
+        # ── Steady-state carrier densities ──────────────────────────────────
+        "n_dark_cm3"       : n0 * 1e-6,
+        "p_dark_cm3"       : p0 * 1e-6,
+        "n_ss_cm3"         : n_ss * 1e-6,
+        "p_ss_cm3"         : p_ss * 1e-6,
+        "delta_n_cm3"      : delta_n * 1e-6,
+        "delta_p_cm3"      : delta_p * 1e-6,
+
+        # ── Electric field ───────────────────────────────────────────────────
+        "E_field_V_cm"     : E_ss * 1e-2,           # [V/cm]
+
+        # ── Currents ────────────────────────────────────────────────────────
+        "J_dark_A_cm2"     : J_dark["J_total"] * 1e-4,
+        "J_total_A_cm2"    : J_ss["J_total"] * 1e-4,
+        "J_photo_A_cm2"    : J_photo * 1e-4,
+        "J_drift_n_A_cm2"  : J_ss["J_drift_n"] * 1e-4,
+        "J_drift_p_A_cm2"  : J_ss["J_drift_p"] * 1e-4,
+
+        # ── Recombination ────────────────────────────────────────────────────
+        "R_ss_cm3_s"       : R_ss * 1e-6,
+        "tau_n_ns"         : mat["tau_n"] * 1e9,
+        "tau_p_ns"         : mat["tau_p"] * 1e9,
+
+        # ── Figures of merit ─────────────────────────────────────────────────
+        "responsivity_A_W" : responsivity,
+        "eta_internal"     : eta_int,
+        "P_optical_mW_cm2" : P_optical * 1e-4 * 1e3,
+
+        # ── Transient (ODE solution object for plotting) ─────────────────────
+        "sol"              : sol,
+        "t_end_s"          : t_end,
+    }
+
+
+# ── Pretty-print helper ───────────────────────────────────────────────────────
+
+def print_results(res: dict) -> None:
+    sep = "─" * 60
+    mat = MATERIALS[res["material"]]
+    print(f"\n{'═'*60}")
+    print(f"  Photodetector Model Results")
+    print(f"  Material : {res['material']}  — {mat['description']}")
+    print(f"{'═'*60}")
+
+    print(f"\n{'OPTICAL':─<40}")
+    print(f"  Wavelength         : {res['wavelength_nm']:.1f} nm")
+    print(f"  Photon energy      : {res['E_photon_eV']:.3f} eV  (E_g = {mat['bandgap_eV']:.3f} eV)")
+    print(f"  Flux               : {res['flux_ph_m2_s']:.2e} ph/m²/s")
+    print(f"  α                  : {res['alpha_cm1']:.2e} cm⁻¹")
+    print(f"  η_absorption       : {res['eta_absorption']*100:.2f} %")
+    print(f"  η_external         : {res['eta_external']*100:.2f} %")
+    print(f"  η_total            : {res['eta_total']*100:.2f} %")
+    print(f"  G                  : {res['G_cm3_s']:.2e} cm⁻³ s⁻¹")
+    print(f"  Optical power      : {res['P_optical_mW_cm2']:.4f} mW/cm²")
+
+    print(f"\n{'BIAS & DEVICE':─<40}")
+    print(f"  V_bias             : {res['V_bias']:.1f} V")
+    print(f"  Thickness          : {res['thickness_um']:.1f} µm")
+    print(f"  N_n (donor)        : {res['N_n_cm3']:.2e} cm⁻³")
+    print(f"  N_p (acceptor)     : {res['N_p_cm3']:.2e} cm⁻³")
+    print(f"  E_field            : {res['E_field_V_cm']:.2e} V/cm")
+
+    print(f"\n{'CARRIERS (steady-state)':─<40}")
+    print(f"  n₀ (dark)          : {res['n_dark_cm3']:.2e} cm⁻³")
+    print(f"  p₀ (dark)          : {res['p_dark_cm3']:.2e} cm⁻³")
+    print(f"  n_ss               : {res['n_ss_cm3']:.2e} cm⁻³")
+    print(f"  p_ss               : {res['p_ss_cm3']:.2e} cm⁻³")
+    print(f"  Δn                 : {res['delta_n_cm3']:.2e} cm⁻³")
+    print(f"  τ_n                : {res['tau_n_ns']:.2f} ns")
+    print(f"  τ_p                : {res['tau_p_ns']:.2f} ns")
+    print(f"  R (net recombin.)  : {res['R_ss_cm3_s']:.2e} cm⁻³ s⁻¹")
+
+    print(f"\n{'CURRENTS':─<40}")
+    print(f"  J_dark             : {res['J_dark_A_cm2']:.4e} A/cm²")
+    print(f"  J_total            : {res['J_total_A_cm2']:.4e} A/cm²")
+    print(f"  J_photo            : {res['J_photo_A_cm2']:.4e} A/cm²")
+    print(f"  J_drift_n          : {res['J_drift_n_A_cm2']:.4e} A/cm²")
+    print(f"  J_drift_p          : {res['J_drift_p_A_cm2']:.4e} A/cm²")
+
+    print(f"\n{'FIGURES OF MERIT':─<40}")
+    print(f"  Responsivity       : {res['responsivity_A_W']:.4f} A/W")
+    print(f"  η_internal (coll.) : {res['eta_internal']*100:.2f} %")
+    print(f"{'═'*60}\n")
+
+
+# ── Wavelength sweep utility ──────────────────────────────────────────────────
+
+def sweep_wavelength(
+    wavelengths_nm: list,
+    flux: float,
+    material_name: str = "Si",
+    V_bias: float = -5.0,
+    **kwargs,
+) -> list:
+    """
+    Run solve_photodetector across a list of wavelengths [nm].
+    Returns a list of result dicts.
+    """
+    results = []
+    for lam_nm in wavelengths_nm:
+        try:
+            r = solve_photodetector(
+                wavelength=lam_nm * 1e-9,
+                flux=flux,
+                material_name=material_name,
+                V_bias=V_bias,
+                **kwargs,
+            )
+            results.append(r)
+        except Exception as e:
+            warnings.warn(f"λ={lam_nm} nm failed: {e}")
+    return results
+
+
+# ── Example usage ─────────────────────────────────────────────────────────────
+
+if __name__ == "__main__":
+    import matplotlib.pyplot as plt
+
+    # ── Example 1: Single operating point ───────────────────────────────────
+    print("\n=== Example 1: Single operating point ===")
+    res = solve_photodetector(
+        wavelength   = 850e-9,       # 850 nm
+        flux         = 1e18,         # 10¹⁸ photons/m²/s  (~100 µW/cm²)
+        material_name= "Si",
+        V_bias       = -5.0,         # 5 V reverse bias
+        N_n          = 1e21,         # 10¹⁵ cm⁻³ n-type
+        N_p          = 0.0,
+        thickness    = 100e-6,       # 100 µm
+        eta_ext      = 0.90,
+        recomb_model = "SRH",
+    )
+    print_results(res)
+
+    # ── Example 2: Wavelength sweep — responsivity spectrum ─────────────────
+    print("=== Example 2: Responsivity spectrum ===")
+    lam_range = np.arange(400, 1150, 10)   # 400–1140 nm
+    sweep     = sweep_wavelength(
+        lam_range, flux=1e18, material_name="Si", V_bias=-5.0,
+        N_n=1e21, thickness=100e-6, eta_ext=0.9
+    )
+
+    lams = [r["wavelength_nm"] for r in sweep]
+    resp = [r["responsivity_A_W"] for r in sweep]
+
+    fig, axes = plt.subplots(2, 2, figsize=(12, 8))
+    fig.suptitle("Si Photodetector Model — Wavelength Sweep", fontsize=14)
+
+    axes[0, 0].plot(lams, resp, "b-")
+    axes[0, 0].set(xlabel="Wavelength [nm]", ylabel="Responsivity [A/W]",
+                   title="Responsivity spectrum")
+    axes[0, 0].grid(True, alpha=0.3)
+
+    alpha_vals = [r["alpha_cm1"] for r in sweep]
+    axes[0, 1].semilogy(lams, alpha_vals, "r-")
+    axes[0, 1].set(xlabel="Wavelength [nm]", ylabel="α [cm⁻¹]",
+                   title="Absorption coefficient")
+    axes[0, 1].grid(True, alpha=0.3)
+
+    eta_abs = [r["eta_absorption"] * 100 for r in sweep]
+    axes[1, 0].plot(lams, eta_abs, "g-")
+    axes[1, 0].set(xlabel="Wavelength [nm]", ylabel="η_abs [%]",
+                   title="Absorption efficiency (100 µm Si)")
+    axes[1, 0].grid(True, alpha=0.3)
+
+    # ── Transient plot from Example 1 ────────────────────────────────────────
+    sol = res["sol"]
+    t_ns = sol.t * 1e9
+    n0_cm3 = res["n_dark_cm3"]
+    p0_cm3 = res["p_dark_cm3"]
+    n_total = (sol.y[0] + n0_cm3 * 1e6) * 1e-6   # Δn → total n in cm⁻³
+    p_total = (sol.y[1] + p0_cm3 * 1e6) * 1e-6
+    axes[1, 1].semilogy(t_ns, n_total, label="n (electrons)")
+    axes[1, 1].semilogy(t_ns, p_total, label="p (holes)")
+    axes[1, 1].set(xlabel="Time [ns]", ylabel="Carrier density [cm⁻³]",
+                   title="Transient carrier density (850 nm, 5V rev. bias)")
+    axes[1, 1].legend()
+    axes[1, 1].grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    plt.savefig("/mnt/user-data/outputs/photodetector_results.png", dpi=150)
+    print("Plot saved to photodetector_results.png")
+    plt.show()

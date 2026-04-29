@@ -1,16 +1,15 @@
 import numpy as np
 import constants
 import materials
-from device import PINJunction
+from device import PINJunction, PNJunction
+from scipy.integrate import cumulative_trapezoid
 
-def electric_field(z: np.ndarray, device: PINJunction, V_bias: float = 0.0, model="depletion") -> np.ndarray:
+def electric_field(device, V_bias: float = 0.0, model="depletion") -> np.ndarray:
     """
     Compute electric field profile across P-i-N junction.
 
     Parameters
     ----------
-    z : ndarray
-        Spatial grid [m], from 0 to device.d.
     device : PINJunction
         Device geometry and doping.
     V_bias : float
@@ -21,59 +20,59 @@ def electric_field(z: np.ndarray, device: PINJunction, V_bias: float = 0.0, mode
     Returns
     -------
     ndarray
-        Electric field E(z) [V/m]. Negative = points toward n-region.
+        Electric field E(z) [V/m]
+        Charge density Rho(z)
+        Voltage V(z)
     """
-    if model == "depletion":
+    if model == 'depletion':
         eps = materials.eps_r * constants.eps_0
         kT  = constants.kb_j * 300
+        z = device.mesh
 
-        # built-in voltage
-        V_bi = (kT / constants.q) * np.log(device.N_A * device.N_D / materials.n_i**2)
-        V_total = V_bi - V_bias   # reverse bias increases total voltage
+        T = 300 # Temperature (room for now)
+        V_t = constants.kb_j * T / constants.q# Thermal voltage
+        V_a = V_bias ## aplied bias, negative is reverse
+        V_bi = V_t * np.log((device.N_A*device.N_D)/(materials.n_i**2)) # computes built-in voltage
+        Vtotal = V_bi - V_a
 
-        # E_max from voltage balance across all three regions:
-        # V_total = (eps * E_max^2) / (2q) * (1/N_A + 1/N_D) + |E_max| * d_i
-        # rearranges to quadratic in E_max:
-        # a*E_max^2 + b*E_max + c = 0
-        a = (eps / (2 * constants.q)) * (1/device.N_A + 1/device.N_D)
-        b = device.d_i
-        c = -V_total
+        if Vtotal <= 0:
+            raise ValueError(
+                f"Va={V_a:.3f} V exceeds V_bi={V_bi:.4f} V — "
+                "depletion approximation breaks down.")
 
-        E_max_magnitude = (-b + np.sqrt(b**2 - 4*a*c)) / (2*a)  # positive, [V/m]
-        E_max = -E_max_magnitude   
-        # depletion widths from E_max
-        x_p = -(eps * E_max) / (constants.q * device.N_A)
-        x_n = -(eps * E_max) / (constants.q * device.N_D)   # E_max negative so this is positive
+        dep_w = np.sqrt(2 * eps / constants.q * (device.N_A+device.N_D)/(device.N_A*device.N_D)*(Vtotal)) # computes depletion width
+        x_n = dep_w * device.N_A / (device.N_A+device.N_D)
+        x_p = dep_w * device.N_D / (device.N_A+device.N_D)
 
-        x_p = min(x_p, device.d_p)
-        x_n = min(x_n, device.d_n)
+        Emax_p = -constants.q * device.N_A * x_p / eps
+        Emax_n = -constants.q * device.N_D * x_n / eps   # should e
 
-        # depletion boundaries
-        z_dep_p = device.z_p - x_p
-        z_dep_n = device.z_i + x_n
+        # Check for matching maximum field
+        if Emax_p != Emax_p:
+            raise ValueError(
+                f"Emax_p = {Emax_p:.3f}, which is not equal to Emax_n = {Emax_n:.3f}"
+            )
+        
+        # Check for xp
+        if x_p > device.d_p:
+            raise ValueError(f"Depletion width xp={x_p*1e9:.1f} nm exceeds p-side length Lp={device.d_p*1e9:.1f} nm.")
+        if x_n > device.d_p:
+            raise ValueError(f"Depletion width xn={x_n*1e9:.1f} nm exceeds n-side length Ln={device.d_n*1e9:.1f} nm.")
+        
+        rho = np.zeros(len(z))
+        rho[(z >= -x_p) & (z <  0)] = -constants.q * device.N_A     # ionised acceptors [C/m^3]
+        rho[(z >= 0)  & (z <= x_n)] =  constants.q * device.N_D    # ionised donors    [C/m^3]
 
-        E = np.zeros_like(z, dtype=float)
+        dEdz = rho / eps                                        # [V/m^2]
+        E = np.concatenate(([0.0], cumulative_trapezoid(dEdz, z))) # [V/m]
+        E[z < -x_p] = 0.0
+        E[z >  x_n] = 0.0
 
-        for idx, zi in enumerate(z):
-            if zi < z_dep_p:
-                E[idx] = 0.0
-            elif zi < device.z_p:
-                E[idx] = -(constants.q * device.N_A / eps) * (zi - z_dep_p)
-            elif zi < device.z_i:
-                E[idx] = E_max
-            elif zi < z_dep_n:
-                E[idx] = E_max + (constants.q * device.N_D / eps) * (zi - device.z_i)
-            else:
-                E[idx] = 0.0
+        V = np.concatenate(([0.0], cumulative_trapezoid(-E, z)))   # [V]
+        V[z < -x_p] = 0.0
+        V[z >  x_n] = V[np.searchsorted(z, x_n)]   # hold the value reached at xn
 
-        print(f"V_bi   = {V_bi:.4f} V")
-        print(f"E_max  = {E_max:.2f} V/m")
-        print(f"x_p    = {x_p*1e9:.2f} nm  (d_p = {device.d_p*1e9:.2f} nm)")
-        print(f"x_n    = {x_n*1e9:.2f} nm  (d_n = {device.d_n*1e9:.2f} nm)")
-        print(f"z_dep_p = {z_dep_p*1e9:.2f} nm")
-        print(f"z_dep_n = {z_dep_n*1e9:.2f} nm")
-
-        return E
-
+        return E, rho, V
     else:
         raise ValueError(f"Unknown electric field model: {model}")
+

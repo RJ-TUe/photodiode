@@ -1,4 +1,5 @@
-# Silicon example values
+# File containing material constants
+# Silicon values
 mu_n = 0.135    # electron mobility [m²/Vs]
 mu_p = 0.048    # hole mobility [m²/Vs]
 D_n  = 0.0025   # electron diffusion coefficient [m²/s]

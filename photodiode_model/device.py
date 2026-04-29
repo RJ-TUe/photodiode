@@ -25,6 +25,7 @@ class PINJunction:
     N_A : float
     N_D : float
 
+    ## Region commands
     @property
     def d(self) -> float:
         """Total device thickness [m]."""

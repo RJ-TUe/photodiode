@@ -1,4 +1,4 @@
-# Physical constants
+# File containing physcal constants
 # Planck's constant
 h = 6.626e-34
 # speed of light

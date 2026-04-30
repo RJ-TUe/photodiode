@@ -115,8 +115,9 @@ class Silicon(Material):
         kT  = constants.kB * T / constants.q            # [eV]
         # Prefactor C in m^-6 K^-3, calibrated to ni(300K) = 9.65e15 m^-3
         C   = 4.5643e42
-        ni2 = C * T**3 * np.exp(-Eg / kT)              # [m^-6]
-        return np.sqrt(ni2)
+        ni2 = C * T**3 * np.exp(-Eg / kT)
+        ni = np.sqrt(ni2)              # [m^-6] -> unused for now, no T dependance.
+        return 1.5e16 
 
     # ── Mobilities (300 K, constant) ─────────────────────────────────────────
 

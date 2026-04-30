@@ -17,9 +17,11 @@ Coordinate convention (established by make_mesh):
 """
 
 from __future__ import annotations
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 import numpy as np
-from materials import Material, Silicon
+import matplotlib.pyplot as plt
+import matplotlib.patches as patches
+from materials import Material
 
 
 # ── Single layer ───────────────────────────────────────────────────────────────
@@ -198,7 +200,6 @@ class Device1D:
         return NA, ND
 
     # ── Material profile ──────────────────────────────────────────────────────
-
     def eps_profile(self, z: np.ndarray) -> np.ndarray:
         """Absolute permittivity eps_s [F/m] evaluated on mesh z."""
         boundaries = np.array(self.z_interfaces)
@@ -212,7 +213,6 @@ class Device1D:
         return eps
 
     # ── Mesh ──────────────────────────────────────────────────────────────────
-
     def make_mesh(self, Nz: int = 20000) -> np.ndarray:
         """
         Uniform mesh over [0, thickness] with Nz points.
@@ -253,6 +253,37 @@ class Device1D:
                 segments.append(np.linspace(z_left, z_right, Nz_interface))
         z = np.unique(np.concatenate(segments))
         return z
+
+    # ── Visualizaion ───────────────────────────────────────────────────────────
+    def display(self):
+        """Display a figure of the current stack, using color coding and squares."""
+        fig, ax = plt.subplots()
+        width = 1
+        len_hold = self.thickness
+        for layer in self.layers:
+            length = layer.thickness
+            if layer.net_doping > 0: # n-doping is green
+                facecolor = 'green'
+                label = 'n'
+            elif layer.net_doping < 0: # p-doping is orange
+                facecolor = 'orange'
+                label = 'p'
+            else:
+                facecolor = 'yellow'
+                label = 'i'
+
+            region = patches.Rectangle((0, len_hold), width, -length,
+                           linewidth=1, edgecolor='black',
+                            facecolor=facecolor, label = label)
+            # Add the patch to the Axes
+            ax.add_patch(region)
+            # update x position
+            len_hold = len_hold - length
+        
+        ax.set_xlim(0, width + 0)
+        ax.set_ylim(0, self.thickness+500e-9)
+        ax.legend()
+        plt.show()
 
     # ── Convenience ───────────────────────────────────────────────────────────
     def summary(self) -> str:

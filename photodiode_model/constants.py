@@ -1,12 +1,9 @@
-# File containing physcal constants
-# Planck's constant
-h = 6.626e-34
-# speed of light
-c = 3e8
-# elementary charge
-q = 1.602e-19
-# permitivvity of free space
-eps_0 = 8.854e-12
-## Boltzman and temp
-kb_eV = 0.02585   # thermal voltage * q [eV] at 300K, in [J] use kT = 1.381e-23 * 300
-kb_j = 1.381e-23
+# Physical constants — SI units throughout.
+# Never import with *. Reference by name: constants.q, constants.kB, etc.
+h    = 6.62607015e-34   # Planck's constant [J·s]
+hbar = 1.05457182e-34   # Reduced Planck's constant [J·s]
+c    = 2.99792458e8     # Speed of light [m/s]
+q    = 1.602176634e-19  # Elementary charge [C]
+eps0 = 8.854187817e-12  # Permittivity of free space [F/m]
+kB   = 1.380649e-23     # Boltzmann constant [J/K]
+m0   = 9.1093837015e-31 # Electron rest mass [kg]

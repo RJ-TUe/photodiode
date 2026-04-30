@@ -1,3 +1,5 @@
+# Define as layer stack, not as a structured device.
+
 from dataclasses import dataclass
 import materials
 import numpy as np
@@ -72,7 +74,8 @@ class PNJunction:
     N_A : float
     N_D : float
     n_points: int = 20000  # default resolution
-    ## Region commands
+
+    ## Region properties
     @property
     def d(self) -> float:
         """Total device thickness [m]."""

@@ -21,6 +21,7 @@ from dataclasses import dataclass
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
+from matplotlib.lines import Line2D
 from materials import Material
 
 
@@ -255,36 +256,68 @@ class Device1D:
         return z
 
     # ── Visualizaion ───────────────────────────────────────────────────────────
-    def display(self):
-        """Display a figure of the current stack, using color coding and squares."""
-        fig, ax = plt.subplots()
-        width = 1
-        len_hold = self.thickness
+    def display(self) -> None:
+        """
+        Display the layer stack as a scaled vertical diagram.
+        Layers are drawn top-to-bottom in stack order (layers[0] at top).
+        Thickness is shown in nm on the y-axis.
+        """
+        COLORS = {'p': '#E8845B', 'i': '#F5E642', 'n': '#6DBF6D'}
+        LABELS = {'p': 'p-type', 'i': 'intrinsic', 'n': 'n-type'}
+
+        fig, ax = plt.subplots(figsize=(3, 5))
+
+        bar_width = 4.0
+        y_cursor  = self.thickness * 1e9   # convert to nm, start at top
+
+        seen = set()   # track which legend entries have been added
+
         for layer in self.layers:
-            length = layer.thickness
-            if layer.net_doping > 0: # n-doping is green
-                facecolor = 'green'
-                label = 'n'
-            elif layer.net_doping < 0: # p-doping is orange
-                facecolor = 'orange'
-                label = 'p'
+            d_nm = layer.thickness * 1e9   # thickness in nm
+
+            if layer.net_doping > 0:
+                kind = 'n'
+            elif layer.net_doping < 0:
+                kind = 'p'
             else:
-                facecolor = 'yellow'
-                label = 'i'
+                kind = 'i'
 
-            region = patches.Rectangle((0, len_hold), width, -length,
-                           linewidth=1, edgecolor='black',
-                            facecolor=facecolor, label = label)
-            # Add the patch to the Axes
-            ax.add_patch(region)
-            # update x position
-            len_hold = len_hold - length
-        
-        ax.set_xlim(0, width + 0)
-        ax.set_ylim(0, self.thickness+500e-9)
-        ax.legend()
+            rect = patches.Rectangle(
+                (0, y_cursor - d_nm),          # (x, y) of bottom-left corner
+                bar_width, d_nm,               # width, height
+                linewidth=1,
+                edgecolor='black',
+                facecolor=COLORS[kind],
+            )
+            ax.add_patch(rect)
+
+            # Layer label: user label if set, otherwise p/i/n
+            text = layer.label if layer.label else kind
+            ax.text(
+                bar_width / 2, y_cursor - d_nm / 2,   # centre of rectangle
+                f"{text}\n{d_nm:.0f} nm",
+                ha='center', va='center',
+                fontsize=9, fontweight='bold',
+            )
+
+            seen.add(kind)
+            y_cursor -= d_nm
+
+        # Build legend without duplicates
+        legend_handles = [
+            Line2D([0], [0], color=COLORS[k], linewidth=8, label=LABELS[k])
+            for k in ('p', 'i', 'n') if k in seen
+        ]
+
+        ax.set_xlim(0, bar_width)
+        ax.set_ylim(0, self.thickness * 1e9)
+        ax.set_ylabel("Position [nm]")
+        ax.set_xticks([])
+        ax.set_title("Device Layer Stack")
+        ax.legend(handles=legend_handles, loc='upper right',
+                bbox_to_anchor=(1.45, 1.0))
+
         plt.show()
-
     # ── Convenience ───────────────────────────────────────────────────────────
     def summary(self) -> str:
         """Human-readable layer stack summary."""
